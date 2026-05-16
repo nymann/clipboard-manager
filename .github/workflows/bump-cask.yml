@@ -1,0 +1,60 @@
+name: Bump cask in homebrew-tap
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    env:
+      CASK: clipboard-manager
+      TAP_REPO: nymann/homebrew-tap
+    steps:
+      - name: Compute version + sha256
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="${CASK}-${version}.zip"
+          gh release download "v${version}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${asset}" \
+            --output "${asset}"
+          sha256=$(sha256sum "${asset}" | awk '{print $1}')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${sha256}"   >> "$GITHUB_OUTPUT"
+
+      - name: Open bump PR against tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA256:  ${{ steps.meta.outputs.sha256 }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
+          cd tap
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="bump-${CASK}-${VERSION}"
+          git checkout -b "${branch}"
+          sed -i -E "s/^(  version )\".*\"/\1\"${VERSION}\"/" "Casks/${CASK}.rb"
+          sed -i -E "s/^(  sha256 )\".*\"/\1\"${SHA256}\"/"   "Casks/${CASK}.rb"
+          if git diff --quiet; then
+            echo "cask already at ${VERSION} with matching sha256 — nothing to do"
+            exit 0
+          fi
+          git commit -am "chore: bump ${CASK} to ${VERSION}"
+          git push -u origin "${branch}"
+          gh pr create \
+            --repo "${TAP_REPO}" \
+            --base main \
+            --head "${branch}" \
+            --title "chore: bump ${CASK} to ${VERSION}" \
+            --body "Auto-bump triggered by ${RELEASE_URL}"

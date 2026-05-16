@@ -1,0 +1,6 @@
+clipboard-manager.app/
+AppIcon.iconset/
+build/
+*.swiftmodule
+.DS_Store
+.run-plans-worktree/
