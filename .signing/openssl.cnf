@@ -1,0 +1,9 @@
+[req]
+distinguished_name=dn
+prompt=no
+[dn]
+CN=clipboard-manager-dev-knj
+[v3_req]
+keyUsage=critical,digitalSignature
+extendedKeyUsage=critical,codeSigning
+basicConstraints=critical,CA:false

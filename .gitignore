@@ -4,3 +4,8 @@ build/
 *.swiftmodule
 .DS_Store
 .run-plans-worktree/
+
+# Private signing material — never publish. Regenerate with
+# `just signing-setup` (the public cert.pem/openssl.cnf are kept).
+.signing/key.pem
+.signing/cert.p12

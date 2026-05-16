@@ -2,36 +2,39 @@
 
 A lightweight macOS clipboard history manager — a leaner replacement
 for Jumpcut. It lives in the menu bar, watches the pasteboard for
-plain-text clips, and gives you two global hotkeys to paste an old clip
-straight back into whatever app you're working in.
+text, styled text and image clips, and binds one global hotkey to a
+searchable command-palette panel.
 
 ## What it does
 
-- **`⌘⌥V` — searchable panel.** A floating panel appears; type to
-  filter, ↑/↓ to move, Return to paste, Esc to dismiss. (Same as
-  left-clicking the menu-bar icon.)
-- **`⌃⌥V` — cycle bezel.** A centered HUD shows the newest clip; each
-  further press steps one clip older. Pause ~1 s and it pastes; press
-  Esc to cancel.
-
-Both hotkeys put the chosen text on the clipboard and paste it into the
-app that was frontmost when you pressed the hotkey.
-
-- Plain text only — formatting, images and files are ignored on
-  purpose.
-- In-memory only — history (last 200, de-duplicated) lives while the
-  app runs and is **not** written to disk. It resets on logout/reboot.
+- **`⌃⇧⌥⌘V` (Hyper+V) — searchable panel.** A blurred command-palette
+  panel appears; type to filter, ↑/↓ to move, Return (or double-click)
+  to paste the selected clip into the app you were in. Clicking
+  anywhere outside it — or Esc — dismisses it. (Same as left-clicking
+  the menu-bar icon.) The Hyper chord pairs with a Caps-Lock-as-Hyper
+  remap such as the [`caps`](https://github.com/nymann/caps) tool. The
+  panel is themed **Catppuccin** — Latte in Light, Frappé in Dark,
+  following the system appearance automatically.
+- Captures **text, styled text, and images**. Bold/italic copied from
+  a rich editor stays bold/italic in the list (recoloured to the theme
+  so it's readable) and pastes back styled.
+- **Images don't sit in memory.** The full image is written once to a
+  disk cache (`$TMPDIR/clipboard-manager-cache/<sha256>.png`); only a
+  thumbnail + size/dimensions are kept in memory. The cache is bounded
+  by the 200-entry ring, a 256 MB total cap (oldest evicted first),
+  and is wiped on launch and on quit. Text/RTF are never written to
+  disk; history (last 200, de-duplicated) resets on logout/reboot.
 - Password-safe — clips marked concealed/transient (password managers,
   other clipboard tools) are skipped.
 
-Right-click the menu-bar icon for the clip count, Clear History,
-Accessibility status and Quit.
+Right-click the menu-bar icon for the clip count, Accessibility status,
+Clear History and Quit.
 
 ## Requirements
 
 - macOS 14+
-- Xcode command line tools (`xcode-select --install`) — provides
-  `swiftc` and `iconutil`.
+- Xcode command line tools (`xcode-select --install`) — `swiftc`,
+  `iconutil`, `codesign`.
 - [`just`](https://github.com/casey/just) — `brew install just`.
 
 ## Install
@@ -46,7 +49,8 @@ brew install --cask nymann/tap/clipboard-manager
 Or from source:
 
 ```sh
-just install        # build clipboard-manager.app and copy it to /Applications
+just signing-setup  # one-time: create the stable signing identity
+just install        # build clipboard-manager.app, copy it to /Applications
 just agent-install  # auto-start at login via launchd
 ```
 
@@ -54,12 +58,19 @@ just agent-install  # auto-start at login via launchd
 
 Auto-paste synthesizes `⌘V`, which macOS gates behind Accessibility.
 On first launch you'll be prompted; grant it in **System Settings →
-Privacy & Security → Accessibility** and relaunch. Until then, clips
-are still captured and the hotkeys still work — the selected clip is
-placed on the clipboard and you press `⌘V` yourself.
+Privacy & Security → Accessibility**. Until then the panel and hotkey
+still work — the selected clip is placed on the clipboard and you press
+`⌘V` yourself (the app flashes a reminder).
 
-The app is ad-hoc signed (not notarized). Clear the Gatekeeper
-quarantine once after a cask install:
+The build is signed with a **stable self-signed identity** created by
+`just signing-setup`, so the Accessibility grant survives rebuilds —
+unlike ad-hoc signing, where every `just build` would void it. The
+identity is local to your machine; the committed `.signing/openssl.cnf`
+plus `just signing-setup` regenerate it, and the private key is
+gitignored.
+
+The app is not notarized. After a cask install, clear the Gatekeeper
+quarantine once:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/clipboard-manager.app
@@ -68,7 +79,9 @@ xattr -dr com.apple.quarantine /Applications/clipboard-manager.app
 ## All recipes
 
 ```
+just signing-setup    One-time: create + import the stable signing identity
 just build            Build clipboard-manager.app in the project directory
+just reload           Rebuild and relaunch (Accessibility grant carries over)
 just install          Build, then copy it to /Applications
 just uninstall        Remove it from /Applications
 just run              Run the binary directly (skips bundling)
@@ -80,23 +93,16 @@ just clean            Remove build artifacts
 just release X.Y.Z    Tag, build, zip, publish a GitHub release
 ```
 
-After editing the source, the typical loop is:
-
-```sh
-just install agent-restart
-```
+After editing the source, the dev loop is just `just reload`.
 
 ## Notes
 
-- Hotkeys are registered with Carbon `RegisterEventHotKey` and need no
-  special permission; only auto-paste needs Accessibility.
-- The TCC Accessibility grant is keyed by bundle id + code signature,
-  so the bundle is ad-hoc codesigned — enough for local use, and the
-  grant persists across rebuilds.
+- The hotkey uses Carbon `RegisterEventHotKey` and needs no special
+  permission; only auto-paste needs Accessibility.
 - `LSUIElement` is set: menu-bar item only, no Dock icon.
-- Hotkeys, cap and capture rules are hardcoded constants in
-  `clipboard-manager.swift` (`enum Cfg`) for v0 — see `design.md` for
-  the rationale and possible later directions.
+- Hotkey and cap are hardcoded constants in `clipboard-manager.swift`
+  (`enum Cfg`) for v0 — see `design.md` for rationale and possible
+  later directions.
 
 ## Release flow
 

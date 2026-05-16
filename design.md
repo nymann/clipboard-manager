@@ -1,144 +1,129 @@
 # clipboard-manager
 
-A lightweight macOS clipboard history manager — a leaner replacement for
-Jumpcut. It watches the system pasteboard, keeps a capped in-memory
-history of plain-text clips, and gives you two global hotkeys to get an
-old clip back into the app you're working in:
-
-- **`⌘⌥V` — searchable panel.** A floating panel pops up; type to
-  filter, arrow keys to move, Return to pick. The chosen clip is put on
-  the pasteboard and immediately pasted into whatever app was frontmost.
-- **`⌃⌥V` — cycle bezel.** A small centered HUD shows the most recent
-  clip. Each further press of the hotkey steps one clip older. Stop
-  pressing for ~1 s and the shown clip is pasted; `Esc` cancels.
-
-Both hotkeys end the same way: the selected text is placed on the
-pasteboard and a synthetic `⌘V` is sent to the app that was frontmost
-when the hotkey fired.
+A lightweight macOS clipboard history manager — a leaner replacement
+for Jumpcut. It lives in the menu bar, watches the pasteboard for
+text, styled text and image clips, keeps a capped history, and binds
+**one** global hotkey — **Hyper+V (`⌃⇧⌥⌘V`)** — that opens a searchable
+command-palette panel. Pick a clip and it's placed on the pasteboard
+and pasted into whatever app was frontmost.
 
 ## Scope (v0)
 
 - Menu-bar-only app (`LSUIElement`), no Dock icon, no main window.
 - Watches `NSPasteboard.general` by polling `changeCount` on a 0.5 s
   timer (the pasteboard has no change notification API).
-- **Plain text only.** Captures `public.utf8-plain-text`
-  (`NSPasteboard.PasteboardType.string`). Images, RTF and files are
-  ignored on purpose — this keeps the store tiny and the UI trivial.
-- **In-memory only.** Nothing is written to disk. History is a capped
-  ring (200 entries) that dies with the process. This is the most
-  private option and needs no storage code; the cost is that history
-  resets on logout/reboot. (See "Possible later directions".)
-- **De-duplicated.** Re-copying an existing clip moves it to the front
-  rather than adding a duplicate.
+- **Three clip kinds**, captured in priority order per pasteboard
+  change:
+  1. **Image** — any `NSImage` on the pasteboard. Re-encoded to PNG.
+  2. **Styled text** — RTF (`NSPasteboard.PasteboardType.rtf`); the
+     plain-text rendering is kept alongside for search/dedup/fallback.
+  3. **Plain text** — `public.utf8-plain-text`.
+  Other file types are ignored.
+- **History is in-memory; image bytes are on disk.** The ring (200
+  entries) dies with the process. Text/RTF live in the ring directly.
+  Images would bloat memory, so the full PNG is written once to a disk
+  cache (`$TMPDIR/clipboard-manager-cache/<sha256>.png`) and only a
+  small thumbnail + metadata is held in memory. The cache is bounded
+  three ways: a file is deleted when its entry leaves the ring; a
+  256 MB total-size cap evicts oldest-first; and the whole directory
+  is wiped on launch *and* on `applicationWillTerminate`. So a fresh
+  run starts clean and files never accumulate — no time-based expiry
+  needed. Nothing text-related is ever written to disk.
+- **De-duplicated.** Re-copying an existing clip moves it to the
+  front. Paste-from-history does **not** reorder, so the list doesn't
+  reshuffle while you scan it.
 - **Password-safe.** Clips whose pasteboard carries
   `org.nspasteboard.ConcealedType` (password managers) or
-  `org.nspasteboard.TransientType` (clipboard tools marking a clip as
-  not-for-history) are skipped.
-- Two global hotkeys, registered with Carbon `RegisterEventHotKey`:
-  - `⌘⌥V` → searchable panel
-  - `⌃⌥V` → cycle bezel
-  Hotkeys are hardcoded in v0 (named constants at the top of
-  `main.swift`); a config file is a "later" item.
-- On pick: write the clip to the pasteboard, re-activate the
+  `org.nspasteboard.TransientType` are skipped.
+- **One global hotkey:** `⌃⇧⌥⌘V` (Hyper+V), registered with Carbon
+  `RegisterEventHotKey`. Pairs naturally with a Caps-Lock-as-Hyper
+  remap (e.g. the sibling `caps` tool); the chord is a hardcoded
+  constant in v0.
+- **Searchable panel:** a borderless, flat **Catppuccin** command-
+  palette panel — Latte in a light appearance, Frappé in a dark one,
+  via dynamic `NSColor`s so "auto" (follow system) just works; nothing
+  forces an appearance (also opened by left-clicking the menu-bar
+  icon). Type to filter
+  (case-insensitive `contains`), ↑/↓ to move, Return / double-click to
+  paste. It dismisses the moment focus leaves it — a click anywhere
+  outside, or Esc.
+- On pick: write the clip to the pasteboard, hand focus back to the
   previously-frontmost app, then post a synthetic `⌘V`.
-- Menu-bar status item: left-click opens the searchable panel;
-  right-click shows a menu (item count, Clear History, the two
-  hotkeys as disabled hints, Accessibility status, Quit).
-- Exit is via the menu's Quit. Errors are logged with `NSLog`; the app
-  never blocks or shows modal alerts.
+- Menu-bar status item right-click: clip count, the hotkey hint, an
+  Accessibility-needed warning when untrusted, Clear History, Quit.
 
-Out of scope for v0: persistence, images/RTF/files, pinned/favourite
-clips, editing a clip before paste, per-app rules, configurable
-hotkeys, Sparkle auto-update, Developer ID signing / notarization.
+There is **no** cycle/bezel mode — an earlier iteration had a
+Jumpcut-style press-to-step bezel; it was cut in favour of the single
+searchable panel. Also out of scope: persistence, images/RTF/files,
+pinned clips, editing before paste, per-app rules, configurable
+hotkey, notarization.
 
-## The cycle bezel vs. classic Jumpcut
+## Permissions and stable signing
 
-Classic Jumpcut works as *hold modifier, tap key to cycle, release
-modifier to paste*. That release-to-commit gesture needs the key-up /
-flags-changed event. Carbon's `RegisterEventHotKey` only delivers a
-single key-**down** per chord, so true release-to-paste isn't available
-without a global event tap (heavier, and a second Accessibility
-surface).
-
-The v0 model instead is **press-to-step, pause-to-commit**:
-
-- First `⌃⌥V`: record the frontmost app, show the bezel at index 0
-  (newest clip).
-- Each further `⌃⌥V` within the window: index += 1 (older), wrapping at
-  the end; the commit timer resets.
-- No press for `commitDelay` (1.0 s): paste the clip at the current
-  index, hide the bezel.
-- A global `Esc` monitor (only active while the bezel is up) cancels
-  without pasting.
-
-This is keyboard-only, needs no event tap, and is faithful to the
-"flick through recent clips without leaving the keyboard" feel even
-though the commit trigger differs.
-
-## Permissions
-
-- **Hotkeys** need nothing — Carbon `RegisterEventHotKey` is not gated
-  by Accessibility.
+- **The hotkey** needs nothing — Carbon `RegisterEventHotKey` is not
+  gated by Accessibility.
 - **Auto-paste** synthesizes `⌘V` with `CGEvent.post`, which requires
   the app to be trusted for Accessibility. At launch the app calls
-  `AXIsProcessTrustedWithOptions` with the prompt option; if not yet
-  trusted it keeps running (history capture and the hotkeys still
-  work) and the right-click menu shows the clip is captured but paste
-  is disabled until the user grants access in System Settings →
-  Privacy & Security → Accessibility.
-- The TCC Accessibility grant is keyed by bundle id **and** code
-  signature, so the bundle is ad-hoc signed (`codesign --sign -`) in
-  the build. Without *any* signature the grant would not persist
-  across rebuilds; ad-hoc is enough for personal use. (Same rationale
-  as the notification grant in the sibling `micflip` tool.)
+  `AXIsProcessTrustedWithOptions` with the prompt option; it keeps
+  running regardless (capture + hotkey + panel all work without it).
+  `paste` re-checks `AXIsProcessTrusted()` **live** every time, and if
+  untrusted it leaves the clip on the pasteboard and flashes a HUD
+  telling you to grant access / press `⌘V` yourself.
+- The TCC Accessibility grant is keyed by bundle id **and code
+  signature**. Ad-hoc signing (`codesign --sign -`) produces a *new*
+  identity on every rebuild, so the grant silently dies each time you
+  rebuild — the symptom is "paste stopped working after a rebuild".
+  To fix that the build signs with a **stable self-signed identity**
+  (`clipboard-manager-dev-knj`) imported into the login keychain, the
+  same approach the sibling `caps` tool uses for its Input-Monitoring
+  grant. Grant Accessibility once and it survives every subsequent
+  `just build` / `just reload`. (For cask users on other machines the
+  self-signed signature behaves like ad-hoc: clear the Gatekeeper
+  quarantine once; the grant is per-machine anyway.)
 
 ## Tech approach
 
 - Language: Swift, one source file (`clipboard-manager.swift`), built
-  with `swiftc -O`. No Xcode project, no SwiftPM manifest — `swiftc`
-  ships with the Command Line Tools. The `.app` bundle is
+  with `swiftc -O`. No Xcode project / SwiftPM. The `.app` bundle is
   hand-assembled by the `justfile` (Info.plist + binary + icon, then
-  ad-hoc codesign), matching the sibling `nosleep` tool.
-- `Cocoa` for the status item / panel / bezel, `Carbon.HIToolbox` for
-  the hotkeys, `CoreGraphics` for the synthetic paste, `Application
-  Services` (`AXIsProcessTrusted…`) for the permission check.
-- `NSApplication` activation policy `.accessory`.
-- A single `AppController` (an `NSApplicationDelegate`) owns the
-  history, the timer, both hotkeys and both UIs. It is exposed as
-  `AppController.shared` so the C hotkey callback can reach it.
+  codesigned with the stable identity), matching the sibling tools.
+- `Cocoa` for the status item / panel / HUD, `Carbon.HIToolbox` for
+  the hotkey, `CoreGraphics` for the synthetic paste,
+  `ApplicationServices` for the Accessibility check.
+- `NSApplication` activation policy `.accessory`. A single
+  `AppController` owns the history, timer, hotkey and panel; exposed
+  as `AppController.shared` so the C hotkey callback can reach it.
 - Pasteboard watcher: a `Timer` every 0.5 s compares
-  `NSPasteboard.general.changeCount` to the last seen value. On
-  change, if a `.string` is present and the pasteboard is not
-  concealed/transient, the trimmed string is pushed onto the history.
-  When *we* write the pasteboard for a paste, we record the new
-  `changeCount` first so the watcher doesn't re-ingest our own write.
-- Searchable panel: an `NSPanel` (`.titled`/`.nonactivatingPanel`
-  borderless, `canBecomeKey == true`) with an `NSSearchField` over an
-  `NSTableView` in an `NSScrollView`. Filtering is a case-insensitive
-  `contains` on the history. A local key monitor handles ↑/↓/Return/Esc
-  while the panel is key.
-- Cycle bezel: a borderless non-activating `NSWindow`, centered,
-  rounded translucent background, one multi-line label plus an
-  `n/total` counter.
-- Paste: `pb.clearContents(); pb.setString(s, forType: .string)`,
-  record `changeCount`, `prevApp?.activate()`, then after a short
-  delay post `v` down+up with `.maskCommand` via
-  `CGEvent(keyboardEventSource:…)` on `.cghidEventTap`.
-- Identify the target app by capturing
-  `NSWorkspace.shared.frontmostApplication` *before* showing any UI,
-  because showing the panel makes this app frontmost.
+  `changeCount`. On change, if a `.string` is present and the
+  pasteboard isn't concealed/transient, the trimmed string is pushed.
+  When *we* write the pasteboard for a paste we record the new
+  `changeCount` first so the watcher doesn't re-ingest it.
+- Panel: a borderless `KeyablePanel: NSPanel` (`canBecomeKey == true`)
+  whose content is a rounded, blurred `NSVisualEffectView` — a leading
+  magnifier glyph + borderless `NSTextField` above a divider and an
+  `.inset` `NSTableView` in an `NSScrollView`, with a faint key-hint
+  footer. Placed centered in the upper third of the active screen.
+  A local key monitor (removed-before-re-added so it can't stack and
+  double-step) handles ↑/↓/Return/Esc; `windowDidResignKey` dismisses
+  on any focus loss.
+- Paste: set the pasteboard, `NSApp.hide(nil)` + reactivate the saved
+  `prevApp` with `.activateIgnoringOtherApps`, then after a short
+  delay post `v` down+up with `.maskCommand` on `.cghidEventTap`. The
+  paste target is captured from `NSWorkspace.shared.frontmostApplication`
+  *before* the panel takes focus.
 
 ## Layout
 
 ```
 clipboard-manager/
   design.md                       this file
-  plans/                          numbered, actionable build plans
+  plans/                          numbered build plans (historical)
   clipboard-manager.swift         the app
   Info.plist                      template baked into the .app
   make-icon.swift                 one-shot AppIcon.iconset generator
   dev.nymann.clipboard-manager.plist  LaunchAgent for start-at-login
-  justfile                        build / install / agent / release
+  .signing/                       openssl.cnf + (gitignored) cert/key
+  justfile                        signing-setup / build / reload / release
   .github/workflows/bump-cask.yml release → PR against homebrew-tap
   README.md
 ```
@@ -146,19 +131,16 @@ clipboard-manager/
 ## Testing
 
 No unit tests in v0, matching the sibling tools: the logic is a
-pasteboard poll, two Carbon hotkeys and a synthetic keystroke, whose
-only real failure modes are environmental (Accessibility denied, hotkey
-already taken). `just test` runs `swiftc -typecheck` over every
-`.swift` source as the syntax/type gate between `run-plans` steps.
+pasteboard poll, one Carbon hotkey and a synthetic keystroke, whose
+only real failure modes are environmental (Accessibility denied,
+hotkey already taken). `just test` runs `swiftc -typecheck` over every
+`.swift` source as the syntax/type gate.
 
 ## Possible later directions
 
 Only if the friction actually shows up:
 
 - Optional on-disk persistence behind a flag / menu toggle.
-- Pinned/favourite clips that survive the ring eviction.
-- Configurable hotkeys + cap via `~/.config/clipboard-manager/config`.
-- Capture images / RTF as additional, separately-rendered kinds.
-- True release-to-paste cycle via a `CGEventTap` (second Accessibility
-  surface — only if the pause-to-commit model annoys in practice).
+- Pinned/favourite clips that survive ring eviction.
+- Configurable hotkey + cap via `~/.config/clipboard-manager/config`.
 - Exclude-app list (don't capture while a given app is frontmost).

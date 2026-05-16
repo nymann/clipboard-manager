@@ -1,57 +1,342 @@
 // clipboard-manager — a lightweight macOS clipboard history manager.
 //
-// Menu-bar only (LSUIElement). Watches NSPasteboard for plain-text
-// clips, keeps a capped de-duplicated in-memory ring, and offers two
-// global hotkeys to paste an old clip back into the frontmost app:
+// Menu-bar only (LSUIElement). Watches NSPasteboard, keeps a capped
+// de-duplicated history of text / styled-text / image clips, and binds
+// one global hotkey — Hyper+V (⌃⇧⌥⌘V) — that opens a searchable
+// Catppuccin command-palette panel; pick a clip and it's pasted into
+// the app that was frontmost.
 //
-//   ⌘⌥V  searchable panel  (also: status-item left-click)
-//   ⌃⌥V  cycle bezel       (press to step older, pause to paste)
-//
-// See design.md for the full rationale. One source file, built with
-// `swiftc -O` and hand-bundled by the justfile.
+// Images are not held in memory: the full image is written once to a
+// disk cache (keyed by content hash) and only a thumbnail + metadata
+// is kept. The cache is bounded by the history ring, a total-size cap,
+// and is wiped on launch and on quit. See design.md.
 
 import ApplicationServices
 import Carbon.HIToolbox
 import Cocoa
 import CoreGraphics
+import CryptoKit
 
 // MARK: - Tunables
 
 enum Cfg {
     static let historyCap = 200
+    static let imageByteCap = 256 * 1024 * 1024  // 256 MB on-disk cache ceiling
     static let pollInterval: TimeInterval = 0.5
-    static let cycleCommitDelay: TimeInterval = 1.0
-    static let pasteKeystrokeDelay: TimeInterval = 0.12
+    static let pasteKeystrokeDelay: TimeInterval = 0.20
     static let panelHotkeyID: UInt32 = 1
-    static let cycleHotkeyID: UInt32 = 2
+    static let thumbMax: CGFloat = 40
+}
+
+// MARK: - Catppuccin theme
+//
+// Latte in a light appearance, Frappé in a dark one. Each colour is a
+// dynamic NSColor whose provider picks the palette from the resolved
+// appearance, so "auto" (follow system) just works — nothing forces an
+// appearance anywhere.
+
+enum Cat {
+    private static func rgb(_ v: UInt32, _ a: CGFloat = 1) -> NSColor {
+        NSColor(srgbRed: CGFloat((v >> 16) & 0xff) / 255,
+                green: CGFloat((v >> 8) & 0xff) / 255,
+                blue: CGFloat(v & 0xff) / 255, alpha: a)
+    }
+
+    // light = Latte, dark = Frappé
+    private static func dyn(_ light: UInt32, _ dark: UInt32, _ a: CGFloat = 1) -> NSColor {
+        NSColor(name: nil) { ap in
+            ap.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? rgb(dark, a) : rgb(light, a)
+        }
+    }
+
+    static let base = dyn(0xeff1f5, 0x303446)
+    static let crust = dyn(0xdce0e8, 0x232634)
+    static let text = dyn(0x4c4f69, 0xc6d0f5)
+    static let subtext0 = dyn(0x6c6f85, 0xa5adce)
+    static let overlay1 = dyn(0x8c8fa1, 0x838ba7)
+    static let surface0 = dyn(0xccd0da, 0x414559)
+    static let accent = dyn(0x1e66f5, 0x8caaee)  // blue
+    static let selFill = dyn(0x1e66f5, 0x8caaee, 0.20)
+    static let selStroke = dyn(0x1e66f5, 0x8caaee, 0.55)
+}
+
+// Resolve a layer-backed view's theme colours under its *own*
+// effective appearance, so light/dark stays correct.
+extension NSView {
+    func withTheme(_ body: () -> Void) {
+        effectiveAppearance.performAsCurrentDrawingAppearance(body)
+    }
+}
+
+// Flat rounded card — replaces a blurred panel so the Catppuccin
+// colours aren't washed out by vibrancy.
+final class ThemedCard: NSView {
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        withTheme {
+            layer?.backgroundColor = Cat.base.cgColor
+            layer?.borderColor = Cat.surface0.cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() { needsDisplay = true }
+}
+
+// 1-pt surface0 hairline.
+final class ThemedHairline: NSView {
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        withTheme { layer?.backgroundColor = Cat.surface0.cgColor }
+    }
+    override func viewDidChangeEffectiveAppearance() { needsDisplay = true }
+}
+
+// Rounded, accent-tinted selection instead of the system highlight.
+final class ThemedRowView: NSTableRowView {
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard isSelected else { return }
+        withTheme {
+            let r = bounds.insetBy(dx: 6, dy: 1)
+            let p = NSBezierPath(roundedRect: r, xRadius: 7, yRadius: 7)
+            Cat.selFill.setFill()
+            p.fill()
+            Cat.selStroke.setStroke()
+            p.lineWidth = 1
+            p.stroke()
+        }
+    }
 }
 
 // Pasteboard types that mark a clip as "do not record".
 let kConcealedType = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
 let kTransientType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
 
+// MARK: - Helpers
+
+func sha256Hex(_ d: Data) -> String {
+    SHA256.hash(data: d).map { String(format: "%02x", $0) }.joined()
+}
+
+func humanBytes(_ n: Int) -> String {
+    let u = ["B", "KB", "MB", "GB"]
+    var v = Double(n), i = 0
+    while v >= 1024, i < u.count - 1 { v /= 1024; i += 1 }
+    return i == 0 ? "\(n) B" : String(format: "%.1f %@", v, u[i])
+}
+
+func makeThumb(_ img: NSImage, max: CGFloat) -> NSImage {
+    let s = img.size
+    guard s.width > 0, s.height > 0 else { return img }
+    let scale = Swift.min(max / s.width, max / s.height, 1)
+    let ns = NSSize(width: s.width * scale, height: s.height * scale)
+    let t = NSImage(size: ns)
+    t.lockFocus()
+    img.draw(in: NSRect(origin: .zero, size: ns),
+             from: NSRect(origin: .zero, size: s),
+             operation: .copy, fraction: 1)
+    t.unlockFocus()
+    return t
+}
+
+// MARK: - On-disk image cache
+
+enum ImageCache {
+    static let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("clipboard-manager-cache", isDirectory: true)
+
+    // Wipe + recreate — called on launch (history is in-memory only,
+    // so a fresh run starts with a fresh cache).
+    static func reset() {
+        try? FileManager.default.removeItem(at: dir)
+        try? FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true)
+    }
+
+    static func wipe() { try? FileManager.default.removeItem(at: dir) }
+
+    static func store(_ data: Data, hash: String) -> URL {
+        let url = dir.appendingPathComponent("\(hash).png")
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? data.write(to: url)
+        }
+        return url
+    }
+
+    static func remove(_ url: URL) { try? FileManager.default.removeItem(at: url) }
+}
+
+// MARK: - Clip model
+
+final class Clip {
+    enum Kind {
+        case text(String)
+        case rich(rtf: Data, plain: String)
+        case image(url: URL, thumb: NSImage, label: String, bytes: Int)
+    }
+
+    let kind: Kind
+    let dedupKey: String
+    let plain: String  // search / dedup / fallback text
+
+    init(text s: String) {
+        kind = .text(s)
+        plain = s
+        dedupKey = "t:" + s
+    }
+
+    init(rtf: Data, plain p: String) {
+        kind = .rich(rtf: rtf, plain: p)
+        plain = p
+        dedupKey = "r:" + sha256Hex(rtf)
+    }
+
+    init(imageURL url: URL, hash: String, thumb: NSImage, label: String, bytes: Int) {
+        kind = .image(url: url, thumb: thumb, label: label, bytes: bytes)
+        plain = label
+        dedupKey = "i:" + hash
+    }
+}
+
 // MARK: - History
 
 final class History {
-    private(set) var items: [String] = []
+    private(set) var items: [Clip] = []
+    private var imageBytes = 0
 
-    func add(_ raw: String) {
-        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return }
-        if let i = items.firstIndex(of: s) { items.remove(at: i) }
-        items.insert(s, at: 0)
-        if items.count > Cfg.historyCap {
-            items.removeLast(items.count - Cfg.historyCap)
+    func add(_ c: Clip) {
+        if let i = items.firstIndex(where: { $0.dedupKey == c.dedupKey }) {
+            // Re-copy: promote the existing entry, discard the dup
+            // (its backing file, if any, is identical and already
+            // referenced by the kept entry).
+            let existing = items.remove(at: i)
+            items.insert(existing, at: 0)
+            return
+        }
+        items.insert(c, at: 0)
+        if case let .image(_, _, _, b) = c.kind { imageBytes += b }
+        evict()
+    }
+
+    private func evict() {
+        while items.count > Cfg.historyCap
+            || (imageBytes > Cfg.imageByteCap && !items.isEmpty)
+        {
+            guard let last = items.popLast() else { break }
+            drop(last)
         }
     }
 
-    func clear() { items.removeAll() }
+    private func drop(_ c: Clip) {
+        if case let .image(url, _, _, b) = c.kind {
+            imageBytes -= b
+            ImageCache.remove(url)
+        }
+    }
+
+    func clear() {
+        items.forEach(drop)
+        items.removeAll()
+        imageBytes = 0
+    }
+}
+
+// MARK: - Styled rendering
+
+// Render an RTF clip with its bold/italic preserved but recoloured to
+// the theme text colour and normalised to one truncatable line — the
+// source's own colours/sizes would clash with (or vanish on) the
+// Catppuccin card.
+func styledDisplay(_ rtf: Data) -> NSAttributedString {
+    guard let a = NSAttributedString(rtf: rtf, documentAttributes: nil) else {
+        return NSAttributedString(string: "")
+    }
+    let m = NSMutableAttributedString(attributedString: a)
+    let full = NSRange(location: 0, length: m.length)
+    let fm = NSFontManager.shared
+
+    m.enumerateAttribute(.font, in: full, options: []) { value, range, _ in
+        var traits: NSFontTraitMask = []
+        if let f = value as? NSFont {
+            let t = fm.traits(of: f)
+            if t.contains(.boldFontMask) { traits.insert(.boldFontMask) }
+            if t.contains(.italicFontMask) { traits.insert(.italicFontMask) }
+        }
+        var f = NSFont.systemFont(ofSize: 13)
+        if traits.contains(.boldFontMask) { f = fm.convert(f, toHaveTrait: .boldFontMask) }
+        if traits.contains(.italicFontMask) { f = fm.convert(f, toHaveTrait: .italicFontMask) }
+        m.addAttribute(.font, value: f, range: range)
+    }
+    m.addAttribute(.foregroundColor, value: Cat.text, range: full)
+    m.removeAttribute(.backgroundColor, range: full)
+
+    // Equal-length substitutions keep attribute ranges intact.
+    let s = m.mutableString
+    s.replaceOccurrences(of: "\n", with: " ", options: [], range: full)
+    s.replaceOccurrences(of: "\t", with: " ", options: [],
+                         range: NSRange(location: 0, length: m.length))
+    let para = NSMutableParagraphStyle()
+    para.lineBreakMode = .byTruncatingTail
+    m.addAttribute(.paragraphStyle, value: para,
+                   range: NSRange(location: 0, length: m.length))
+    return m
+}
+
+// MARK: - Clip cell
+
+final class ClipCell: NSView {
+    static let id = NSUserInterfaceItemIdentifier("ClipCell")
+    let thumb = NSImageView()
+    let label = NSTextField(labelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        identifier = ClipCell.id
+        thumb.translatesAutoresizingMaskIntoConstraints = false
+        thumb.imageScaling = .scaleProportionallyDown
+        thumb.setContentHuggingPriority(.required, for: .horizontal)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.lineBreakMode = .byTruncatingTail
+        label.cell?.usesSingleLineMode = true
+        label.font = .systemFont(ofSize: 13)
+        addSubview(thumb)
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            thumb.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            thumb.centerYAnchor.constraint(equalTo: centerYAnchor),
+            thumb.widthAnchor.constraint(equalToConstant: Cfg.thumbMax),
+            thumb.heightAnchor.constraint(equalToConstant: 30),
+            label.leadingAnchor.constraint(equalTo: thumb.trailingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func configure(_ clip: Clip) {
+        switch clip.kind {
+        case let .text(s):
+            thumb.image = nil
+            label.attributedStringValue = NSAttributedString(
+                string: s.replacingOccurrences(of: "\n", with: " ")
+                    .replacingOccurrences(of: "\t", with: " "),
+                attributes: [.foregroundColor: Cat.text,
+                             .font: NSFont.systemFont(ofSize: 13)])
+        case let .rich(rtf, _):
+            thumb.image = nil
+            label.attributedStringValue = styledDisplay(rtf)
+        case let .image(_, t, lbl, _):
+            thumb.image = t
+            label.attributedStringValue = NSAttributedString(
+                string: lbl,
+                attributes: [.foregroundColor: Cat.subtext0,
+                             .font: NSFont.systemFont(ofSize: 13)])
+        }
+    }
 }
 
 // MARK: - Keyable panel
 
-// A borderless NSPanel won't become key by default, which would stop
-// the search field from receiving text. Force it.
 final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -60,7 +345,7 @@ final class KeyablePanel: NSPanel {
 // MARK: - App controller
 
 final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSource,
-    NSTableViewDelegate, NSSearchFieldDelegate
+    NSTableViewDelegate, NSTextFieldDelegate, NSWindowDelegate
 {
     static var shared: AppController?
 
@@ -70,37 +355,35 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     private var pollTimer: Timer?
     private var lastChangeCount = NSPasteboard.general.changeCount
 
-    private var hotkeyRefs: [EventHotKeyRef?] = []
-
-    // App that was frontmost when a hotkey fired — the paste target.
-    private var prevApp: NSRunningApplication?
-
-    private var axTrusted = false
+    private var hotkeyRef: EventHotKeyRef?
 
     // Searchable panel
     private var panel: KeyablePanel?
-    private var searchField: NSSearchField!
+    private var searchField: NSTextField!
     private var table: NSTableView!
-    private var filtered: [String] = []
+    private var filtered: [Clip] = []
     private var panelMonitor: Any?
+    private var panelVisible = false
 
-    // Cycle bezel
-    private var bezel: NSWindow?
-    private var bezelLabel: NSTextField!
-    private var bezelCounter: NSTextField!
-    private var cycleIndex = 0
-    private var cycleTimer: Timer?
-    private var escMonitor: Any?
+    // Transient notice HUD
+    private var notice: NSWindow?
+    private var noticeLabel: NSTextField!
+    private var noticeToken = UUID()
 
     // MARK: Lifecycle
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        axTrusted = AXIsProcessTrustedWithOptions(
+        ImageCache.reset()
+        _ = AXIsProcessTrustedWithOptions(
             [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
 
         setupStatusItem()
         startWatching()
-        installHotkeys()
+        installHotkey()
+    }
+
+    func applicationWillTerminate(_ note: Notification) {
+        ImageCache.wipe()
     }
 
     // MARK: Status item
@@ -142,9 +425,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         menu.addItem(header)
         menu.addItem(.separator())
 
-        menu.addItem(disabled("Panel:  ⌘⌥V"))
-        menu.addItem(disabled("Cycle:  ⌃⌥V"))
-        if !axTrusted {
+        menu.addItem(disabled("Open panel:  ⌃⇧⌥⌘V"))
+        if !AXIsProcessTrusted() {
             menu.addItem(.separator())
             let warn = NSMenuItem(
                 title: "Enable Accessibility to auto-paste…",
@@ -201,19 +483,50 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
 
         let types = pb.types ?? []
         if types.contains(kConcealedType) || types.contains(kTransientType) { return }
-        guard let s = pb.string(forType: .string) else { return }
-        history.add(s)
+
+        // Priority: image → styled text → plain text.
+        if let clip = imageClip(pb) ?? richClip(pb) ?? textClip(pb) {
+            history.add(clip)
+        }
     }
 
-    // Call right after we write the pasteboard ourselves so the next
-    // poll doesn't re-ingest our own clip.
+    private func imageClip(_ pb: NSPasteboard) -> Clip? {
+        guard let img = NSImage(pasteboard: pb),
+              let tiff = img.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:])
+        else { return nil }
+        let hash = sha256Hex(png)
+        let url = ImageCache.store(png, hash: hash)
+        let label = "Image · \(rep.pixelsWide)×\(rep.pixelsHigh) · \(humanBytes(png.count))"
+        return Clip(imageURL: url, hash: hash,
+                    thumb: makeThumb(img, max: Cfg.thumbMax),
+                    label: label, bytes: png.count)
+    }
+
+    private func richClip(_ pb: NSPasteboard) -> Clip? {
+        guard let rtf = pb.data(forType: .rtf),
+              let a = NSAttributedString(rtf: rtf, documentAttributes: nil)
+        else { return nil }
+        let plain = a.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !plain.isEmpty else { return nil }
+        return Clip(rtf: rtf, plain: plain)
+    }
+
+    private func textClip(_ pb: NSPasteboard) -> Clip? {
+        guard let s = pb.string(forType: .string) else { return nil }
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return nil }
+        return Clip(text: t)
+    }
+
     private func markPasteboardWritten() {
         lastChangeCount = NSPasteboard.general.changeCount
     }
 
-    // MARK: Hotkeys
+    // MARK: Hotkey
 
-    private func installHotkeys() {
+    private func installHotkey() {
         var spec = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed))
@@ -226,58 +539,55 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
                     event, EventParamName(kEventParamDirectObject),
                     EventParamType(typeEventHotKeyID), nil,
                     MemoryLayout<EventHotKeyID>.size, nil, &hk)
-                let id = hk.id
-                DispatchQueue.main.async { AppController.shared?.handleHotkey(id) }
+                DispatchQueue.main.async { AppController.shared?.handleHotkey() }
                 return noErr
             },
             1, &spec, nil, nil)
 
-        register(id: Cfg.panelHotkeyID,
-                 keyCode: UInt32(kVK_ANSI_V),
-                 modifiers: UInt32(cmdKey | optionKey))
-        register(id: Cfg.cycleHotkeyID,
-                 keyCode: UInt32(kVK_ANSI_V),
-                 modifiers: UInt32(controlKey | optionKey))
-    }
-
-    private func register(id: UInt32, keyCode: UInt32, modifiers: UInt32) {
-        let hkID = EventHotKeyID(
-            signature: OSType(0x434C_4250 /* 'CLBP' */), id: id)
-        var ref: EventHotKeyRef?
+        // Hyper+V — Control+Shift+Option+Command+V. Pairs with a
+        // Caps-Lock-as-Hyper remap (e.g. the sibling `caps` tool).
+        let hkID = EventHotKeyID(signature: OSType(0x434C_4250 /* 'CLBP' */),
+                                 id: Cfg.panelHotkeyID)
+        let mods = UInt32(controlKey | shiftKey | optionKey | cmdKey)
         let status = RegisterEventHotKey(
-            keyCode, modifiers, hkID, GetApplicationEventTarget(), 0, &ref)
+            UInt32(kVK_ANSI_V), mods, hkID, GetApplicationEventTarget(), 0, &hotkeyRef)
         if status != noErr {
-            NSLog("clipboard-manager: RegisterEventHotKey \(id) failed (\(status)) — chord may be in use")
+            NSLog("clipboard-manager: RegisterEventHotKey failed (\(status)) — chord may be in use")
         }
-        hotkeyRefs.append(ref)
     }
 
-    func handleHotkey(_ id: UInt32) {
-        // Capture the paste target before any of our UI takes focus.
-        prevApp = NSWorkspace.shared.frontmostApplication
-        switch id {
-        case Cfg.panelHotkeyID: showPanel()
-        case Cfg.cycleHotkeyID: cycleStep()
-        default: break
-        }
-    }
+    func handleHotkey() { showPanel() }
 
     // MARK: Paste
 
-    private func paste(_ text: String) {
+    private func paste(_ clip: Clip) {
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString(text, forType: .string)
+        switch clip.kind {
+        case let .text(s):
+            pb.setString(s, forType: .string)
+        case let .rich(rtf, plain):
+            pb.setData(rtf, forType: .rtf)
+            pb.setString(plain, forType: .string)
+        case let .image(url, _, _, _):
+            if let data = try? Data(contentsOf: url) {
+                pb.setData(data, forType: .png)
+                if let img = NSImage(data: data), let tiff = img.tiffRepresentation {
+                    pb.setData(tiff, forType: .tiff)
+                }
+            }
+        }
         markPasteboardWritten()
 
-        history.add(text)  // promote to most-recent
-
-        guard axTrusted else {
-            NSLog("clipboard-manager: clip on pasteboard; grant Accessibility for auto-paste")
+        guard AXIsProcessTrusted() else {
+            showNotice("Enable Accessibility for auto-paste\n(clip is on the clipboard — ⌘V to paste)")
+            NSLog("clipboard-manager: not Accessibility-trusted; clip left on pasteboard")
             return
         }
 
-        prevApp?.activate(options: [])
+        // Relinquish our accessory app — macOS returns activation to
+        // the app that was frontmost before us — then synthesize ⌘V.
+        NSApp.hide(nil)
         DispatchQueue.main.asyncAfter(deadline: .now() + Cfg.pasteKeystrokeDelay) {
             let src = CGEventSource(stateID: .combinedSessionState)
             let v = CGKeyCode(kVK_ANSI_V)
@@ -294,47 +604,92 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     // MARK: Searchable panel
 
     private func showPanel() {
-        if prevApp == nil { prevApp = NSWorkspace.shared.frontmostApplication }
         if panel == nil { buildPanel() }
         guard let panel else { return }
 
         searchField.stringValue = ""
         applyFilter("")
-        panel.center()
+        positionPanel(panel)
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(searchField)
+        panelVisible = true
 
+        // Remove any prior monitor first — re-showing the panel
+        // without this stacks monitors, so each ↑/↓ moves twice.
+        if let m = panelMonitor { NSEvent.removeMonitor(m); panelMonitor = nil }
         panelMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
             [weak self] e in self?.panelKeyDown(e) ?? e
         }
     }
 
+    private func positionPanel(_ panel: NSWindow) {
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let size = panel.frame.size
+        let x = screen.midX - size.width / 2
+        let y = screen.minY + screen.height * 0.62 - size.height / 2
+        panel.setFrameOrigin(NSPoint(x: x.rounded(), y: y.rounded()))
+    }
+
     private func buildPanel() {
         let p = KeyablePanel(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 360),
-            styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
+            contentRect: NSRect(x: 0, y: 0, width: 660, height: 440),
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false)
-        p.titleVisibility = .hidden
-        p.titlebarAppearsTransparent = true
-        p.isMovableByWindowBackground = true
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = true
         p.level = .floating
+        p.isMovableByWindowBackground = true
         p.hidesOnDeactivate = false
         p.isReleasedWhenClosed = false
+        p.delegate = self
+        p.animationBehavior = .utilityWindow
 
-        let content = NSView(frame: p.contentLayoutRect)
-        content.autoresizingMask = [.width, .height]
+        let card = ThemedCard(frame: p.contentView!.bounds)
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 16
+        card.layer?.cornerCurve = .continuous
+        card.layer?.masksToBounds = true
+        card.layer?.borderWidth = 1
+        card.autoresizingMask = [.width, .height]
 
-        let sf = NSSearchField(frame: .zero)
-        sf.placeholderString = "Filter clips…"
+        let glyph = NSImageView()
+        glyph.image = NSImage(systemSymbolName: "magnifyingglass",
+                              accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 18, weight: .regular))
+        glyph.contentTintColor = Cat.overlay1
+        glyph.translatesAutoresizingMaskIntoConstraints = false
+
+        let sf = NSTextField(frame: .zero)
         sf.delegate = self
+        sf.isBordered = false
+        sf.drawsBackground = false
+        sf.focusRingType = .none
+        sf.font = .systemFont(ofSize: 22, weight: .light)
+        sf.textColor = Cat.text
+        sf.placeholderAttributedString = NSAttributedString(
+            string: "Search clipboard…",
+            attributes: [.foregroundColor: Cat.subtext0,
+                         .font: NSFont.systemFont(ofSize: 22, weight: .light)])
+        sf.lineBreakMode = .byTruncatingTail
+        sf.cell?.usesSingleLineMode = true
         sf.translatesAutoresizingMaskIntoConstraints = false
         searchField = sf
 
+        let divider = ThemedHairline()
+        divider.wantsLayer = true
+        divider.translatesAutoresizingMaskIntoConstraints = false
+
         let tv = NSTableView()
         tv.headerView = nil
-        tv.rowHeight = 22
+        tv.rowHeight = 38
+        tv.style = .inset
+        tv.backgroundColor = .clear
+        tv.selectionHighlightStyle = .regular
+        tv.allowsEmptySelection = false
         tv.allowsMultipleSelection = false
+        tv.intercellSpacing = NSSize(width: 0, height: 2)
         tv.dataSource = self
         tv.delegate = self
         tv.target = self
@@ -348,20 +703,45 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         scroll.documentView = tv
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
+        scroll.automaticallyAdjustsContentInsets = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
-        content.addSubview(sf)
-        content.addSubview(scroll)
-        p.contentView = content
+        let hint = NSTextField(labelWithString: "↑ ↓ navigate     ↵ paste     click away to dismiss")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = Cat.subtext0
+        hint.alignment = .center
+        hint.drawsBackground = false
+        hint.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(glyph)
+        card.addSubview(sf)
+        card.addSubview(divider)
+        card.addSubview(scroll)
+        card.addSubview(hint)
+        p.contentView = card
 
         NSLayoutConstraint.activate([
-            sf.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
-            sf.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
-            sf.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
-            scroll.topAnchor.constraint(equalTo: sf.bottomAnchor, constant: 8),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
-            scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10),
+            glyph.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 20),
+            glyph.centerYAnchor.constraint(equalTo: sf.centerYAnchor),
+            glyph.widthAnchor.constraint(equalToConstant: 22),
+
+            sf.topAnchor.constraint(equalTo: card.topAnchor, constant: 18),
+            sf.leadingAnchor.constraint(equalTo: glyph.trailingAnchor, constant: 10),
+            sf.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -20),
+
+            divider.topAnchor.constraint(equalTo: sf.bottomAnchor, constant: 16),
+            divider.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            divider.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            divider.heightAnchor.constraint(equalToConstant: 1),
+
+            scroll.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 6),
+            scroll.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
+            scroll.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -8),
+            scroll.bottomAnchor.constraint(equalTo: hint.topAnchor, constant: -6),
+
+            hint.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            hint.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            hint.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -10),
         ])
         panel = p
     }
@@ -370,7 +750,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
         filtered = q.isEmpty
             ? history.items
-            : history.items.filter { $0.lowercased().contains(q) }
+            : history.items.filter { $0.plain.lowercased().contains(q) }
         table?.reloadData()
         if !filtered.isEmpty {
             table?.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
@@ -378,17 +758,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     }
 
     private func dismissPanel() {
+        guard panelVisible else { return }
+        panelVisible = false
         if let m = panelMonitor { NSEvent.removeMonitor(m); panelMonitor = nil }
         panel?.orderOut(nil)
-        prevApp?.activate(options: [])
+    }
+
+    func windowDidResignKey(_ note: Notification) {
+        if (note.object as? NSWindow) === panel { dismissPanel() }
     }
 
     private func commitPanelSelection() {
         let row = table.selectedRow
         guard row >= 0, row < filtered.count else { dismissPanel(); return }
-        let text = filtered[row]
+        let clip = filtered[row]
         dismissPanel()
-        paste(text)
+        paste(clip)
     }
 
     @objc private func panelDoubleClick() { commitPanelSelection() }
@@ -396,7 +781,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     private func panelKeyDown(_ e: NSEvent) -> NSEvent? {
         switch Int(e.keyCode) {
         case kVK_Escape:
-            dismissPanel(); return nil
+            dismissPanel()
+            NSApp.hide(nil)
+            return nil
         case kVK_Return, kVK_ANSI_KeypadEnter:
             commitPanelSelection(); return nil
         case kVK_DownArrow:
@@ -422,88 +809,38 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int)
         -> NSView?
     {
-        let id = NSUserInterfaceItemIdentifier("cell")
-        let field: NSTextField
-        if let reused = tableView.makeView(withIdentifier: id, owner: self) as? NSTextField {
-            field = reused
-        } else {
-            field = NSTextField(labelWithString: "")
-            field.identifier = id
-            field.lineBreakMode = .byTruncatingTail
-            field.font = .systemFont(ofSize: 12)
-        }
-        let oneLine = filtered[row]
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\t", with: " ")
-        field.stringValue = oneLine
-        return field
+        let cell = (tableView.makeView(withIdentifier: ClipCell.id, owner: self) as? ClipCell)
+            ?? ClipCell(frame: .zero)
+        cell.configure(filtered[row])
+        return cell
     }
 
-    // NSSearchField delegate
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        ThemedRowView()
+    }
+
     func controlTextDidChange(_ obj: Notification) {
         applyFilter(searchField.stringValue)
     }
 
-    // MARK: Cycle bezel
+    // MARK: Notice HUD
 
-    private func cycleStep() {
-        guard !history.items.isEmpty else {
-            flashBezel("no clips")
-            return
-        }
-        if bezel == nil { buildBezel() }
-        if bezel?.isVisible != true {
-            cycleIndex = 0
-            startEscMonitor()
-        } else {
-            cycleIndex = (cycleIndex + 1) % history.items.count
-        }
-        renderBezel()
-        bezel?.center()
-        bezel?.orderFrontRegardless()
-
-        cycleTimer?.invalidate()
-        cycleTimer = Timer.scheduledTimer(
-            withTimeInterval: Cfg.cycleCommitDelay, repeats: false
-        ) { [weak self] _ in self?.commitCycle() }
-    }
-
-    private func commitCycle() {
-        guard let items = bezelItemsSnapshot(), cycleIndex < items.count else {
-            hideBezel(); return
-        }
-        let text = items[cycleIndex]
-        hideBezel()
-        paste(text)
-    }
-
-    private func bezelItemsSnapshot() -> [String]? {
-        history.items.isEmpty ? nil : history.items
-    }
-
-    private func cancelCycle() { hideBezel() }
-
-    private func hideBezel() {
-        cycleTimer?.invalidate(); cycleTimer = nil
-        stopEscMonitor()
-        bezel?.orderOut(nil)
-    }
-
-    private func startEscMonitor() {
-        stopEscMonitor()
-        escMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) {
-            [weak self] e in
-            if Int(e.keyCode) == kVK_Escape { self?.cancelCycle() }
+    private func showNotice(_ text: String) {
+        if notice == nil { buildNotice() }
+        noticeLabel.stringValue = text
+        guard let notice else { return }
+        notice.center()
+        notice.orderFrontRegardless()
+        let token = UUID()
+        noticeToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) { [weak self] in
+            if self?.noticeToken == token { self?.notice?.orderOut(nil) }
         }
     }
 
-    private func stopEscMonitor() {
-        if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
-    }
-
-    private func buildBezel() {
+    private func buildNotice() {
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 150),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 110),
             styleMask: [.borderless], backing: .buffered, defer: false)
         w.isOpaque = false
         w.backgroundColor = .clear
@@ -513,63 +850,31 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         w.isReleasedWhenClosed = false
         w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
 
-        let blur = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 420, height: 150))
-        blur.material = .hudWindow
-        blur.state = .active
-        blur.blendingMode = .behindWindow
-        blur.wantsLayer = true
-        blur.layer?.cornerRadius = 16
-        blur.layer?.masksToBounds = true
-        blur.autoresizingMask = [.width, .height]
+        let card = ThemedCard(frame: NSRect(x: 0, y: 0, width: 420, height: 110))
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 16
+        card.layer?.cornerCurve = .continuous
+        card.layer?.masksToBounds = true
+        card.layer?.borderWidth = 1
+        card.autoresizingMask = [.width, .height]
 
         let label = NSTextField(wrappingLabelWithString: "")
         label.alignment = .center
-        label.font = .systemFont(ofSize: 16, weight: .medium)
-        label.maximumNumberOfLines = 4
-        label.lineBreakMode = .byTruncatingTail
+        label.font = .systemFont(ofSize: 14, weight: .medium)
+        label.textColor = Cat.text
+        label.maximumNumberOfLines = 3
+        label.drawsBackground = false
         label.translatesAutoresizingMaskIntoConstraints = false
-        bezelLabel = label
+        noticeLabel = label
 
-        let counter = NSTextField(labelWithString: "")
-        counter.alignment = .center
-        counter.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        counter.textColor = .secondaryLabelColor
-        counter.translatesAutoresizingMaskIntoConstraints = false
-        bezelCounter = counter
-
-        blur.addSubview(label)
-        blur.addSubview(counter)
-        w.contentView = blur
-
+        card.addSubview(label)
+        w.contentView = card
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: 18),
-            label.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -18),
-            label.centerYAnchor.constraint(equalTo: blur.centerYAnchor, constant: -8),
-            counter.centerXAnchor.constraint(equalTo: blur.centerXAnchor),
-            counter.bottomAnchor.constraint(equalTo: blur.bottomAnchor, constant: -12),
+            label.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 18),
+            label.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -18),
+            label.centerYAnchor.constraint(equalTo: card.centerYAnchor),
         ])
-        bezel = w
-    }
-
-    private func renderBezel() {
-        let items = history.items
-        guard cycleIndex < items.count else { return }
-        let raw = items[cycleIndex]
-        let trimmed = raw.count > 240 ? String(raw.prefix(240)) + "…" : raw
-        bezelLabel.stringValue = trimmed
-            .replacingOccurrences(of: "\t", with: "    ")
-        bezelCounter.stringValue = "\(cycleIndex + 1) / \(items.count)   ·   Esc to cancel"
-    }
-
-    private func flashBezel(_ text: String) {
-        if bezel == nil { buildBezel() }
-        bezelLabel.stringValue = text
-        bezelCounter.stringValue = ""
-        bezel?.center()
-        bezel?.orderFrontRegardless()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            self?.bezel?.orderOut(nil)
-        }
+        notice = w
     }
 }
 

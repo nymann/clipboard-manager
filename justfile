@@ -2,6 +2,7 @@ app := "clipboard-manager.app"
 bin := "clipboard-manager"
 agent := "dev.nymann.clipboard-manager"
 plist := agent + ".plist"
+signid := "clipboard-manager-dev-knj"
 
 default: build
 
@@ -21,7 +22,28 @@ test:
         swiftc -typecheck "$f"
     done
 
-# Assemble clipboard-manager.app in the project dir and ad-hoc sign it.
+# One-time: create a stable self-signed code-signing identity and
+# import it into the login keychain. A *stable* signature (vs ad-hoc,
+# whose identity changes every rebuild) is what lets the macOS
+# Accessibility/TCC grant survive `just build` — auto-paste needs it.
+# Re-run only if the keychain identity is missing.
+signing-setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd .signing
+    if [[ ! -f cert.pem || ! -f key.pem ]]; then
+        openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+            -days 3650 -nodes -config openssl.cnf -extensions v3_req
+    fi
+    openssl pkcs12 -export -legacy -inkey key.pem -in cert.pem \
+        -out cert.p12 -name "{{signid}}" -passout pass:clipboard
+    security import cert.p12 -k ~/Library/Keychains/login.keychain-db \
+        -P clipboard -A -T /usr/bin/codesign
+    echo "imported signing identity: {{signid}}"
+
+# Assemble clipboard-manager.app and sign it with the stable identity
+# (falls back to ad-hoc if the identity isn't in the keychain — run
+# `just signing-setup` once so the Accessibility grant persists).
 build:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -33,7 +55,23 @@ build:
     swift make-icon.swift "$iconset"
     iconutil -c icns "$iconset" -o {{app}}/Contents/Resources/AppIcon.icns
     cp Info.plist {{app}}/Contents/Info.plist
-    codesign --force --sign - {{app}}
+    if security find-certificate -c "{{signid}}" >/dev/null 2>&1; then
+        codesign --force --sign "{{signid}}" \
+            --identifier {{agent}} {{app}}
+    else
+        echo "warning: '{{signid}}' not in keychain — ad-hoc signing; the" >&2
+        echo "Accessibility grant will reset on every rebuild. Run 'just signing-setup'." >&2
+        codesign --force --sign - {{app}}
+    fi
+
+# Rebuild and relaunch the project-dir bundle (the stable signature
+# means the Accessibility grant carries over — no re-grant needed).
+reload: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pkill -x {{bin}} 2>/dev/null || true
+    sleep 0.5
+    open {{app}}
 
 # Build, then copy clipboard-manager.app to /Applications.
 install: build
